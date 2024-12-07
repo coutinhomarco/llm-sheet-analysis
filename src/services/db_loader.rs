@@ -1,224 +1,217 @@
-use rusqlite::{Connection, types::ValueRef};
+use tokio_rusqlite::Connection;
+use tokio::sync::Mutex;
+use moka::sync::Cache;
 use polars::prelude::*;
 use crate::error::AppError;
-use std::sync::Mutex;
 use tracing::{info, debug, error, warn};
+use std::time::Duration;
+use rusqlite::types::ValueRef;
+use std::sync::Arc;
 
+const BATCH_SIZE: usize = 1000;
+const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
+const CACHE_CAPACITY: u64 = 100;
+
+#[derive(Clone)]
 pub struct DbLoader {
-    conn: Mutex<Connection>,
-    current_table: Mutex<Option<String>>,
-    column_names: Mutex<Vec<String>>,
+    conn: Arc<Mutex<Connection>>,
+    cache: Cache<String, DataFrame>,
+    current_table: Arc<Mutex<Option<String>>>,
+    column_names: Arc<Mutex<Vec<String>>>,
 }
+
 impl DbLoader {
-    pub fn new() -> Result<Self, AppError> {
+    pub async fn new() -> Result<Self, AppError> {
         info!("Creating new DbLoader instance");
         let conn = Connection::open_in_memory()
-            .map_err(|e| {
-                error!("Failed to open in-memory database: {}", e);
-                AppError::DatabaseError(e.to_string())
-            })?;
-        
-        debug!("Successfully created in-memory database connection");
+            .await
+            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+        let cache = Cache::builder()
+            .max_capacity(CACHE_CAPACITY)
+            .time_to_live(CACHE_TTL)
+            .build();
+
+        debug!("Successfully created connection and cache");
         Ok(Self {
-            conn: Mutex::new(conn),
-            current_table: Mutex::new(None),
-            column_names: Mutex::new(Vec::new()),
+            conn: Arc::new(Mutex::new(conn)),
+            cache,
+            current_table: Arc::new(Mutex::new(None)),
+            column_names: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
     pub async fn load_dataframe(&self, df: DataFrame, table_name: &str) -> Result<(), AppError> {
         info!("Loading DataFrame into table: {}", table_name);
         debug!("DataFrame shape: {} rows x {} columns", df.height(), df.width());
-        
-        // Store column names before processing
-        let column_names: Vec<String> = df.get_column_names()
-            .iter()
-            .map(|&s| s.to_string())
-            .collect();
-        
-        let conn = self.conn.lock().map_err(|e| {
-            error!("Failed to acquire database lock: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
-        
-        // Drop existing table if it exists
-        let drop_sql = format!("DROP TABLE IF EXISTS {}", table_name);
-        conn.execute(&drop_sql, []).map_err(|e| {
-            error!("Failed to drop existing table: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
-        
-        // Create table schema
-        let schema = df.schema();
-        debug!("Generated schema: {:?}", schema);
-        
-        let create_table_sql = self.generate_create_table_sql(table_name, &schema)?;
-        debug!("Create table SQL: {}", create_table_sql);
-        
-        conn.execute(&create_table_sql, []).map_err(|e| {
-            error!("Failed to create table: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
-        
-        // Generate insert SQL statement
-        let insert_sql = self.generate_insert_sql(table_name, &df)?;
-        debug!("Insert SQL template: {}", insert_sql);
-        
-        // Prepare the statement
-        let mut stmt = conn.prepare(&insert_sql).map_err(|e| {
-            error!("Failed to prepare insert statement: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
-    
-        // Process row by row
-        info!("Starting row insertion for {} rows", df.height());
-        for row_idx in 0..df.height() {
-            if row_idx % 100 == 0 {
-                debug!("Processing row {}/{}", row_idx, df.height());
-            }
-            
-            let params: Vec<rusqlite::types::ToSqlOutput> = df
-                .get_columns()
+
+        // Update current_table and column_names BEFORE database operations
+        {
+            *self.current_table.lock().await = Some(table_name.to_string());
+            *self.column_names.lock().await = df.get_column_names()
                 .iter()
-                .map(|series| {
-                    match series.get(row_idx) {
-                        Ok(value) => match value {
-                            AnyValue::Null => rusqlite::types::ToSqlOutput::from(rusqlite::types::Null),
-                            AnyValue::Int32(v) => rusqlite::types::ToSqlOutput::from(v),
-                            AnyValue::Int64(v) => rusqlite::types::ToSqlOutput::from(v),
-                            AnyValue::Float32(v) => rusqlite::types::ToSqlOutput::from(v as f64),
-                            AnyValue::Float64(v) => rusqlite::types::ToSqlOutput::from(v),
-                            AnyValue::String(v) => rusqlite::types::ToSqlOutput::from(v.to_string()),
-                            AnyValue::Boolean(v) => rusqlite::types::ToSqlOutput::from(v),
-                            _ => rusqlite::types::ToSqlOutput::from(value.to_string()),
-                        },
-                        Err(e) => {
-                            warn!("Error getting value at row {}: {}", row_idx, e);
-                            rusqlite::types::ToSqlOutput::from(rusqlite::types::Null)
-                        }
+                .map(|&s| s.to_string())
+                .collect();
+        }
+
+        // Cache the DataFrame
+        self.cache.insert(table_name.to_string(), df.clone());
+        
+        let conn = self.conn.lock().await;
+        let df = df.clone();
+        let table_name = table_name.to_string();
+        let this = self.clone();
+        
+        conn.call(move |conn: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            
+            // Drop existing table if it exists
+            let drop_sql = format!("DROP TABLE IF EXISTS {}", table_name);
+            tx.execute(&drop_sql, [])?;
+
+            // Create table schema
+            let schema = df.schema();
+            let create_table_sql = this.generate_create_table_sql(&table_name, &schema)
+                .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            tx.execute(&create_table_sql, [])?;
+
+            // Generate insert SQL statement
+            let insert_sql = this.generate_insert_sql(&table_name, &df)
+                .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+
+            // Process in batches
+            let total_rows = df.height();
+            for chunk_start in (0..total_rows).step_by(BATCH_SIZE) {
+                let chunk_end = (chunk_start + BATCH_SIZE).min(total_rows);
+                debug!("Processing batch {}-{}/{}", chunk_start, chunk_end, total_rows);
+
+                {
+                    let mut stmt = tx.prepare(&insert_sql)?;
+                    for row_idx in chunk_start..chunk_end {
+                        let params = this.prepare_row_params(&df, row_idx)
+                            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+                        let param_refs: Vec<&dyn rusqlite::ToSql> = params
+                            .iter()
+                            .map(|p| p as &dyn rusqlite::ToSql)
+                            .collect();
+
+                        stmt.execute(param_refs.as_slice())?;
+                    }
+                } // stmt is dropped here, releasing the borrow on tx
+            }
+
+            // Now we can safely commit
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))
+    }
+
+    fn prepare_row_params(&self, df: &DataFrame, row_idx: usize) -> Result<Vec<Box<dyn rusqlite::ToSql>>, AppError> {
+        df.get_columns()
+            .iter()
+            .map(|series| {
+                Ok(match series.get(row_idx) {
+                    Ok(value) => match value {
+                        AnyValue::Null => Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::Int32(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::Int64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::Float32(v) => Box::new(v as f64) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::Float64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::String(v) => Box::new(v.to_string()) as Box<dyn rusqlite::ToSql>,
+                        AnyValue::Boolean(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                        _ => Box::new(value.to_string()) as Box<dyn rusqlite::ToSql>,
+                    },
+                    Err(e) => {
+                        warn!("Error getting value at row {}: {}", row_idx, e);
+                        Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>
                     }
                 })
-                .collect();
-    
-            let param_refs: Vec<&dyn rusqlite::ToSql> = params
-                .iter()
-                .map(|p| p as &dyn rusqlite::ToSql)
-                .collect();
-    
-            if let Err(e) = stmt.execute(param_refs.as_slice()) {
-                error!("Failed to insert row {}: {}", row_idx, e);
-                return Err(AppError::DatabaseError(e.to_string()));
-            }
-        }
-    
-        info!("Successfully loaded DataFrame into table {}", table_name);
-        
-        // Verify table was created
-        let verify_sql = format!("SELECT COUNT(*) FROM {}", table_name);
-        let count: i64 = conn.query_row(&verify_sql, [], |row| row.get(0)).map_err(|e| {
-            error!("Failed to verify table creation: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
-        
-        info!("Verified table {} contains {} rows", table_name, count);
-        
-        // Update the struct's state using the Mutex guards
-        {
-            let mut current_table = self.current_table.lock().map_err(|e| {
-                error!("Failed to acquire current_table lock: {}", e);
-                AppError::DatabaseError(e.to_string())
-            })?;
-            *current_table = Some(table_name.to_string());
-
-            let mut stored_column_names = self.column_names.lock().map_err(|e| {
-                error!("Failed to acquire column_names lock: {}", e);
-                AppError::DatabaseError(e.to_string())
-            })?;
-            *stored_column_names = column_names;
-        }
-
-        Ok(())
+            })
+            .collect()
     }
+
     pub async fn get_schema_with_samples(&self) -> Result<String, AppError> {
-        if !self.has_data() {
+        if !self.has_data().await {
             warn!("Attempted to get schema before loading any data");
             return Ok("No data has been loaded into the database yet".to_string());
         }
         
-        info!("Getting schema with samples");
-        let conn = self.conn.lock().map_err(|e| {
-            error!("Failed to acquire database lock: {}", e);
-            AppError::DatabaseError(e.to_string())
-        })?;
+        let conn = self.conn.lock().await;
         
-        // Get all tables
-        debug!("Querying for all tables");
-        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-        let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
+        conn.call(|conn: &mut rusqlite::Connection| -> rusqlite::Result<String> {
+            // Get all tables
+            debug!("Querying for all tables");
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+            let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
+                .filter_map(Result::ok)
+                .collect();
 
-        debug!("Found tables: {:?}", tables);
-        
-        if tables.is_empty() {
-            warn!("No tables found in database");
-            return Ok("No tables found in database".to_string());
-        }
-
-        let mut schema = String::new();
-        for table in tables {
-            info!("Processing table: {}", table);
-            schema.push_str(&format!("\nTable: {}\n", table));
+            debug!("Found tables: {:?}", tables);
             
-            // Get column info
-            let pragma_sql = format!("PRAGMA table_info('{}')", table);
-            debug!("Getting column info with: {}", pragma_sql);
-            
-            let mut stmt = conn.prepare(&pragma_sql)?;
-            let cols: Vec<(String, String)> = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?, // column name
-                    row.get::<_, String>(2)?, // data type
-                ))
-            })?
-            .filter_map(Result::ok)
-            .collect();
-
-            debug!("Found columns: {:?}", cols);
-            
-            schema.push_str("Columns:\n");
-            for col in cols {
-                schema.push_str(&format!("  {} {}\n", col.0, col.1));
+            if tables.is_empty() {
+                warn!("No tables found in database");
+                return Ok("No tables found in database".to_string());
             }
 
-            // Get sample data
-            let sample_sql = format!("SELECT * FROM '{}' LIMIT 3", table);
-            let mut stmt = conn.prepare(&sample_sql)?;
-            let mut rows = stmt.query([])?;
-            
-            schema.push_str("\nSample Data:\n");
-            while let Some(row) = rows.next()? {
-                let mut row_data = Vec::new();
-                let column_count = row.as_ref().column_count();
+            let mut schema = String::new();
+            for table in tables {
+                info!("Processing table: {}", table);
+                schema.push_str(&format!("\nTable: {}\n", table));
                 
-                for i in 0..column_count {
-                    let value = match row.get_ref(i)? {
-                        ValueRef::Null => "NULL".to_string(),
-                        ValueRef::Integer(i) => i.to_string(),
-                        ValueRef::Real(f) => f.to_string(),
-                        ValueRef::Text(t) => format!("'{}'", String::from_utf8_lossy(t)),
-                        ValueRef::Blob(_) => "BLOB".to_string(),
-                    };
-                    row_data.push(value);
-                }
-                schema.push_str(&format!("  {}\n", row_data.join(", ")));
-            }
-            schema.push_str("\n");
-        }
+                // Get column info
+                let pragma_sql = format!("PRAGMA table_info('{}')", table);
+                debug!("Getting column info with: {}", pragma_sql);
+                
+                let mut stmt = conn.prepare(&pragma_sql)?;
+                let cols: Vec<(String, String)> = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?, // column name
+                        row.get::<_, String>(2)?, // data type
+                    ))
+                })?
+                .filter_map(Result::ok)
+                .collect();
 
-        info!("Successfully generated schema");
-        debug!("Final schema: {}", schema);
-        Ok(schema)
+                debug!("Found columns: {:?}", cols);
+                
+                schema.push_str("Columns:\n");
+                for col in cols {
+                    schema.push_str(&format!("  {} {}\n", col.0, col.1));
+                }
+
+                // Get sample data
+                let sample_sql = format!("SELECT * FROM '{}' LIMIT 3", table);
+                let mut stmt = conn.prepare(&sample_sql)?;
+                let mut rows = stmt.query([])?;
+                
+                schema.push_str("\nSample Data:\n");
+                while let Some(row) = rows.next()? {
+                    let mut row_data = Vec::new();
+                    let column_count = row.as_ref().column_count();
+                    
+                    for i in 0..column_count {
+                        let value = match row.get_ref(i)? {
+                            ValueRef::Null => "NULL".to_string(),
+                            ValueRef::Integer(i) => i.to_string(),
+                            ValueRef::Real(f) => f.to_string(),
+                            ValueRef::Text(t) => format!("'{}'", String::from_utf8_lossy(t)),
+                            ValueRef::Blob(_) => "BLOB".to_string(),
+                        };
+                        row_data.push(value);
+                    }
+                    schema.push_str(&format!("  {}\n", row_data.join(", ")));
+                }
+                schema.push_str("\n");
+            }
+
+            info!("Successfully generated schema");
+            debug!("Final schema: {}", schema);
+            Ok(schema)
+        })
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))
     }
 
     // Helper methods for SQL generation
@@ -254,56 +247,29 @@ impl DbLoader {
         ))
     }
 
-    pub async fn get_database_schema(&self) -> Result<String, AppError> {
-        let conn = self.conn.lock()
-            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        let mut schema = String::new();
-        
-        // Get all tables
-        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-        let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
-
-        for table in tables {
-            schema.push_str(&format!("\nTable: {}\n", table));
-            
-            // Get column info
-            let pragma_sql = format!("PRAGMA table_info('{}')", table);
-            let mut stmt = conn.prepare(&pragma_sql)?;
-            let cols = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?, // column name
-                    row.get::<_, String>(2)?, // data type
-                ))
-            })?;
-
-            for col in cols {
-                if let Ok((name, type_)) = col {
-                    schema.push_str(&format!("  - {}: {}\n", name, type_));
-                }
-            }
-        }
-
-        Ok(schema)
-    }
-
     // Add a new method to check if data is loaded
-    pub fn has_data(&self) -> bool {
+    pub async fn has_data(&self) -> bool {
         let has_table = self.current_table.lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false);
+            .await
+            .is_some();
         
-        let has_columns = self.column_names.lock()
-            .map(|guard| !guard.is_empty())
-            .unwrap_or(false);
+        let has_columns = !self.column_names.lock()
+            .await
+            .is_empty();
+
+        tracing::debug!(
+            "has_data check - has_table: {}, has_columns: {}", 
+            has_table, 
+            has_columns
+        );
         
         has_table && has_columns
     }
 
-    pub fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AppError> {
-        self.conn.lock().map_err(|e| {
-            AppError::DatabaseError(format!("Failed to acquire database lock: {}", e))
-        })
+    pub async fn get_connection(&self) -> Result<tokio::sync::MutexGuard<'_, Connection>, AppError> {
+        match self.conn.lock().await {
+            guard => Ok(guard)
+        }
     }
 }
+

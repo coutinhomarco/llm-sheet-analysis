@@ -9,12 +9,19 @@ use polars::io::csv::CsvReader;
 use bytes::Bytes;
 use crate::services::db_loader::DbLoader;
 use reqwest::Client;
+use rayon::prelude::*;
+use smallvec::SmallVec;
+use std::collections::HashSet;
+
+const SAMPLE_SIZE: usize = 5;
+const TYPE_DETECTION_ROWS: usize = 100;
+const MAX_ANALYSIS_ROWS: usize = 1000;
 
 #[derive(Debug)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
-    pub sample_values: Vec<String>,
+    pub sample_values: SmallVec<[String; SAMPLE_SIZE]>,
     pub null_count: usize,
     pub unique_count: usize,
     pub min_value: Option<String>,
@@ -36,42 +43,40 @@ pub struct SheetAnalysis {
 }
 
 fn detect_column_type(values: &[Data]) -> String {
-    let mut numeric_count = 0;
-    let mut date_count = 0;
-    let mut _string_count = 0;
-    let mut bool_count = 0;
-    let mut empty_count = 0;
-    
-    for value in values {
-        match value {
-            Data::Float(_) | Data::Int(_) => numeric_count += 1,
-            Data::DateTime(_) => date_count += 1,
-            Data::String(s) => {
-                if is_date_string(s) {
-                    date_count += 1;
-                } else {
-                    _string_count += 1;
+    let (numeric_count, date_count, bool_count, empty_count) = values.par_iter()
+        .take(TYPE_DETECTION_ROWS)
+        .filter(|v| !matches!(v, Data::Empty))
+        .fold(
+            || (0, 0, 0, 0),
+            |(mut num, mut date, mut bool, mut empty), value| {
+                match value {
+                    Data::Float(_) | Data::Int(_) => num += 1,
+                    Data::DateTime(_) => date += 1,
+                    Data::String(s) if is_date_string(s) => date += 1,
+                    Data::Bool(_) => bool += 1,
+                    Data::Empty => empty += 1,
+                    _ => {}
                 }
-            },
-            Data::Bool(_) => bool_count += 1,
-            Data::Empty => empty_count += 1,
-            _ => {}
-        }
-    }
-    
+                (num, date, bool, empty)
+            }
+        )
+        .reduce(|| (0, 0, 0, 0),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+        );
+
     let total = values.len() - empty_count;
     if total == 0 {
         return "empty".to_string();
     }
-    
-    let threshold = total as f64 * 0.8; // 80% threshold
-    
-    if numeric_count as f64 >= threshold { "numeric" }
-    else if date_count as f64 >= threshold { "date" }
-    else if bool_count as f64 >= threshold { "boolean" }
-    else { "string" }.to_string()
-}
 
+    let threshold = total as f64 * 0.8;
+    match () {
+        _ if numeric_count as f64 >= threshold => "numeric",
+        _ if date_count as f64 >= threshold => "date",
+        _ if bool_count as f64 >= threshold => "boolean",
+        _ => "string",
+    }.to_string()
+}
 fn is_date_string(s: &str) -> bool {
     let patterns = [
         r"^\d{4}-\d{2}-\d{2}$",
@@ -86,38 +91,44 @@ fn is_date_string(s: &str) -> bool {
 }
 
 fn analyze_column(values: &[Data], name: &str) -> ColumnInfo {
-    let mut sample_values = Vec::new();
-    let mut null_count = 0;
-    let mut seen_values = std::collections::HashSet::new();
-    let mut min_value: Option<String> = None;
-    let mut max_value: Option<String> = None;
-
-    for value in values.iter().take(5) {
-        let str_value = match value {
-            Data::Empty => {
-                null_count += 1;
-                "".to_string()
-            },
-            _ => value.to_string()
-        };
-        sample_values.push(str_value);
-    }
-
-    for value in values {
-        let str_value = value.to_string();
-        if matches!(value, Data::Empty) {
-            null_count += 1;
-        } else {
-            seen_values.insert(str_value.clone());
-            
-            if min_value.is_none() || str_value < min_value.as_ref().unwrap().to_string() {
-                min_value = Some(str_value.clone());
+    let mut sample_values = SmallVec::<[String; SAMPLE_SIZE]>::new();
+    
+    let (null_count, seen_values, min_max) = values.par_iter()
+        .fold(
+            || (0, HashSet::new(), (None, None)),
+            |(mut nulls, mut seen, mut min_max), value| {
+                let str_value = value.to_string();
+                if matches!(value, Data::Empty) {
+                    nulls += 1;
+                } else {
+                    seen.insert(str_value.clone());
+                    update_min_max(&mut min_max, &str_value);
+                }
+                (nulls, seen, min_max)
             }
-            if max_value.is_none() || str_value > max_value.as_ref().unwrap().to_string() {
-                max_value = Some(str_value);
+        )
+        .reduce(
+            || (0, HashSet::new(), (None, None)),
+            |a, b| {
+                let mut combined_set = a.1;
+                combined_set.extend(b.1);
+                (
+                    a.0 + b.0,
+                    combined_set,
+                    merge_min_max(a.2, b.2)
+                )
             }
-        }
-    }
+        );
+
+    // Get sample values
+    values.iter()
+        .take(SAMPLE_SIZE)
+        .for_each(|value| {
+            sample_values.push(match value {
+                Data::Empty => "".to_string(),
+                _ => value.to_string()
+            });
+        });
 
     ColumnInfo {
         name: name.to_string(),
@@ -125,8 +136,8 @@ fn analyze_column(values: &[Data], name: &str) -> ColumnInfo {
         sample_values,
         null_count,
         unique_count: seen_values.len(),
-        min_value,
-        max_value,
+        min_value: min_max.0,
+        max_value: min_max.1,
         has_duplicates: seen_values.len() < values.len() - null_count,
     }
 }
@@ -167,9 +178,9 @@ pub async fn analyze_excel_file<P: AsRef<Path>>(path: P) -> Result<SheetAnalysis
                 .unwrap_or_default();
 
             // Quick column type detection
-            let mut date_columns = Vec::new();
-            let mut numeric_columns = Vec::new();
-            let mut text_columns = Vec::new();
+            let mut date_columns: Vec<String> = Vec::new();
+            let mut numeric_columns: Vec<String> = Vec::new();
+            let mut text_columns: Vec<String> = Vec::new();
             
             // Take sample rows for analysis
             let sample_data: Vec<Vec<String>> = rows.iter()
@@ -178,55 +189,52 @@ pub async fn analyze_excel_file<P: AsRef<Path>>(path: P) -> Result<SheetAnalysis
                 .collect();
 
             // Basic column analysis
-            let column_info = headers.iter().enumerate()
-                .map(|(idx, name)| {
+            let (column_info, date_cols, numeric_cols, text_cols) = headers.par_iter().enumerate()
+            .fold(
+                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                |mut acc, (idx, name)| {
                     let values: Vec<Data> = rows.iter()
                         .skip(1)
-                        .take(100) // Only analyze first 100 rows for type detection
-                        .map(|row| row.get(idx).cloned().unwrap_or(Data::Empty))
+                        .take(TYPE_DETECTION_ROWS)
+                        .filter_map(|row| row.get(idx).cloned())
                         .collect();
                     
-                    let data_type = detect_column_type(&values);
-                    match data_type.as_str() {
-                        "date" => date_columns.push(name.clone()),
-                        "numeric" => numeric_columns.push(name.clone()),
-                        "string" => text_columns.push(name.clone()),
+                    let info = analyze_column(&values, name);
+                    match info.data_type.as_str() {
+                        "date" => acc.1.push(name.clone()),
+                        "numeric" => acc.2.push(name.clone()),
+                        "string" => acc.3.push(name.clone()),
                         _ => {}
                     }
-                    
-                    // Convert to strings before counting uniques
-                    let string_values: Vec<String> = values.iter()
-                        .map(|v| v.to_string())
-                        .collect();
-                    let unique_values: std::collections::HashSet<_> = string_values.iter().collect();
-                    
-                    ColumnInfo {
-                        name: name.clone(),
-                        data_type,
-                        sample_values: values.iter().take(5).map(|v| v.to_string()).collect(),
-                        null_count: values.iter().filter(|v| matches!(v, Data::Empty)).count(),
-                        unique_count: unique_values.len(),
-                        min_value: None, // Skip min/max for performance
-                        max_value: None,
-                        has_duplicates: false, // Skip duplicate check for performance
-                    }
-                })
-                .collect();
+                    acc.0.push(info);
+                    acc
+                }
+            )
+            .reduce(
+                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                |mut a, b| {
+                    a.0.extend(b.0);
+                    a.1.extend(b.1);
+                    a.2.extend(b.2);
+                    a.3.extend(b.3);
+                    a
+                }
+            );
 
             tracing::info!("Analysis completed FILEPROCESSOR 216 in {:?}", start.elapsed());
             
             let df = create_dataframe(&rows, &headers)?;
             
             Ok(SheetAnalysis {
-                sheet_names,
+                sheet_names: sheet_names,
                 row_count,
                 column_count,
-                sample_data,
-                column_info,
+                sample_data: sample_data,
+                column_info: column_info,
                 dataframe: Some(df),
-                date_columns,
-                numeric_columns,
-                text_columns,
+                date_columns: date_cols,
+                numeric_columns: numeric_cols,
+                text_columns: text_cols,
             })
         } else {
             Err(AppError::InvalidInput("Failed to read worksheet".to_string()))
@@ -541,9 +549,9 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
                 .unwrap_or_default();
 
             // Quick column type detection
-            let mut date_columns = Vec::new();
-            let mut numeric_columns = Vec::new();
-            let mut text_columns = Vec::new();
+            let mut date_columns: Vec<String> = Vec::new();
+            let mut numeric_columns: Vec<String> = Vec::new();
+            let mut text_columns: Vec<String> = Vec::new();
             
             // Take sample rows for analysis
             let sample_data: Vec<Vec<String>> = rows.iter()
@@ -575,15 +583,15 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
             tracing::info!("Analysis completed FILEPROCESSOR 575 in {:?}", start.elapsed());
             
             Ok(SheetAnalysis {
-                sheet_names,
+                sheet_names: sheet_names,
                 row_count,
                 column_count,
-                sample_data,
-                column_info,
+                sample_data: sample_data,
+                column_info: column_info,
                 dataframe: None,
-                date_columns,
-                numeric_columns,
-                text_columns,
+                date_columns: date_columns,
+                numeric_columns: numeric_columns,
+                text_columns: text_columns,
             })
         } else {
             Err(AppError::FileProcessingError("Failed to read worksheet".to_string()))
@@ -618,4 +626,34 @@ pub async fn process_file(file_bytes: &[u8], _file_extension: &str, db_loader: &
     db_loader.load_dataframe(df, &clean_table_name).await?;
 
     Ok(1) // Return 1 for one table processed
+}
+
+fn update_min_max(min_max: &mut (Option<String>, Option<String>), value: &str) {
+    match &min_max.0 {
+        None => min_max.0 = Some(value.to_string()),
+        Some(min) if value.to_string() < *min => min_max.0 = Some(value.to_string()),
+        _ => {}
+    }
+    match &min_max.1 {
+        None => min_max.1 = Some(value.to_string()),
+        Some(max) if value.to_string() > *max => min_max.1 = Some(value.to_string()),
+        _ => {}
+    }
+}
+
+fn merge_min_max(
+    a: (Option<String>, Option<String>), 
+    b: (Option<String>, Option<String>)
+) -> (Option<String>, Option<String>) {
+    let min = match (a.0, b.0) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(v1), Some(v2)) => Some(if v1 < v2 { v1 } else { v2 }),
+    };
+    let max = match (a.1, b.1) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(v1), Some(v2)) => Some(if v1 > v2 { v1 } else { v2 }),
+    };
+    (min, max)
 }

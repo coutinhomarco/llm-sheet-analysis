@@ -9,7 +9,6 @@ mod logging;
 mod routes;
 mod services;
 pub mod models;
-pub mod clients;
 
 #[tokio::main]
 async fn main() -> Result<()> {

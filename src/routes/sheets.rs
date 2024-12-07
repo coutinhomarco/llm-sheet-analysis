@@ -73,7 +73,7 @@ async fn analyze_sheet(
     let analysis = file_processor::analyze_excel_file(&request.file_path).await?;
     
     // 2. Create DbLoader and load data into SQLite
-    let db_loader = DbLoader::new()?;
+    let db_loader = DbLoader::new().await?;
     let table_name = format!("excel_{}", chrono::Utc::now().timestamp());
     
     // Only try to load if we have a DataFrame
@@ -93,15 +93,17 @@ async fn analyze_sheet(
 
     Ok(Json(FullAnalysisResponse {
         analysis: AnalyzeResponse {
-            sheet_names: analysis.sheet_names,
+            sheet_names: analysis.sheet_names.to_vec(),
             row_count: analysis.row_count,
             column_count: analysis.column_count,
-            sample_data: analysis.sample_data,
+            sample_data: analysis.sample_data.into_iter()
+                .map(|row| row.to_vec())
+                .collect(),
             column_analysis: analysis.column_info.into_iter()
                 .map(|info| ColumnAnalysis {
                     name: info.name,
                     data_type: info.data_type,
-                    sample_values: info.sample_values,
+                    sample_values: info.sample_values.to_vec(),
                     null_count: info.null_count,
                     unique_count: info.unique_count,
                     min_value: info.min_value,
@@ -109,9 +111,9 @@ async fn analyze_sheet(
                     has_duplicates: info.has_duplicates,
                 })
                 .collect(),
-            date_columns: analysis.date_columns,
-            numeric_columns: analysis.numeric_columns,
-            text_columns: analysis.text_columns,
+            date_columns: analysis.date_columns.to_vec(),
+            numeric_columns: analysis.numeric_columns.to_vec(),
+            text_columns: analysis.text_columns.to_vec(),
         },
         tool_result: query_result,
         new_file_url: None,

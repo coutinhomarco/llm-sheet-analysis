@@ -31,18 +31,25 @@ dotenvy = "0.15"
 polars = { version = "0.37", features = ["lazy"] }
 calamine = "0.24"
 
-# Database (using rusqlite instead of sqlx)
-rusqlite = { version = "0.30", features = ["bundled"] }
+# Database
+rusqlite = { version = "0.29", features = ["bundled"] }
+tokio-rusqlite = "0.4"
+moka = { version = "0.12", features = ["sync"] }  # Changed from future to sync
+parking_lot = "0.12"
+
+
 
 regex = "1.10"
 
 chrono = "0.4"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 rayon = "1.8"
-parking_lot = "0.12"
 once_cell = "1.18"
 async-openai = "0.18.1"
 bytes = "1.5"
+smallvec = "1.11"
+futures = "0.3"
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"

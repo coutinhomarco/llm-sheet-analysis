@@ -60,6 +60,12 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
+impl From<tokio_rusqlite::Error> for AppError {
+    fn from(err: tokio_rusqlite::Error) -> Self {
+        AppError::DatabaseError(err.to_string())
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {

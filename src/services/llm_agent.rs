@@ -14,7 +14,7 @@ use async_openai::{
 use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::services::db_loader::DbLoader;
-use polars::datatypes::{AnyValue, DataType};
+use polars::datatypes::AnyValue;
 use rusqlite::types::ValueRef;
 use serde_json::Value as JsonValue;
 
@@ -57,9 +57,9 @@ enum SqlValue {
 }
 
 impl LlmAgent {
-    pub fn new(api_key: &str) -> Result<Self, AppError> {
+    pub async fn new(api_key: &str) -> Result<Self, AppError> {
         let config = OpenAIConfig::new().with_api_key(api_key);
-        let db_loader = DbLoader::new()?;
+        let db_loader = DbLoader::new().await?;
         
         Ok(Self {
             client: Client::with_config(config),
@@ -589,6 +589,7 @@ impl LlmAgent {
     }
 
     pub async fn execute_queries(&self, response: AgentResponse) -> Result<QueryResult, AppError> {
+        let conn = self.db_loader.get_connection().await?;
         let mut json_results = Vec::new();
         
         if response.queries.is_empty() {
@@ -598,61 +599,61 @@ impl LlmAgent {
             });
         }
 
-        let conn = self.db_loader.get_connection()?;
-        
         for sql_query in response.queries {
             tracing::info!("Executing SQL query: {}", sql_query);
             
-            let mut stmt = conn.prepare(&sql_query).map_err(|e| {
-                AppError::DatabaseError(format!("Failed to prepare query: {}", e))
-            })?;
-            
-            let column_names: Vec<String> = stmt
-                .column_names()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            
-            let column_count = stmt.column_count();
-            let mut rows_data = Vec::new();
-            
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let mut row_values = Vec::new();
-                for i in 0..column_count {
-                    let value = match row.get_ref(i)? {
-                        ValueRef::Null => SqlValue::Null,
-                        ValueRef::Integer(i) => SqlValue::Integer(i),
-                        ValueRef::Real(f) => SqlValue::Float(f),
-                        ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
-                        ValueRef::Blob(_) => SqlValue::Blob,
-                    };
-                    row_values.push(value);
-                }
-                rows_data.push(row_values);
-            }
+            let results = conn.call(move |conn: &mut rusqlite::Connection| -> rusqlite::Result<serde_json::Value> {
+                let mut stmt = conn.prepare(&sql_query)?;
+                
+                let column_names: Vec<String> = stmt
+                    .column_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                
+                let column_count = stmt.column_count();
+                let mut rows_data = Vec::new();
+                
+                let mut rows = stmt.query([])?;
 
-            // Convert to JSON
-            let json_value = serde_json::json!({
-                "columns": column_names,
-                "rows": rows_data.iter().map(|row| {
-                    row.iter().map(|value| match value {
-                        SqlValue::Null => JsonValue::Null,
-                        SqlValue::Integer(i) => JsonValue::Number((*i).into()),
-                        SqlValue::Float(f) => {
-                            if f.is_finite() {
-                                JsonValue::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into()))
-                            } else {
-                                JsonValue::Null
-                            }
-                        },
-                        SqlValue::Text(s) => JsonValue::String(s.clone()),
-                        SqlValue::Blob => JsonValue::String("BLOB".to_string()),
+                while let Some(row) = rows.next()? {
+                    let mut row_values = Vec::new();
+                    for i in 0..column_count {
+                        let value = match row.get_ref(i)? {
+                            ValueRef::Null => SqlValue::Null,
+                            ValueRef::Integer(i) => SqlValue::Integer(i),
+                            ValueRef::Real(f) => SqlValue::Float(f),
+                            ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
+                            ValueRef::Blob(_) => SqlValue::Blob,
+                        };
+                        row_values.push(value);
+                    }
+                    rows_data.push(row_values);
+                }
+
+                Ok(serde_json::json!({
+                    "columns": column_names,
+                    "rows": rows_data.iter().map(|row| {
+                        row.iter().map(|value| match value {
+                            SqlValue::Null => JsonValue::Null,
+                            SqlValue::Integer(i) => JsonValue::Number((*i).into()),
+                            SqlValue::Float(f) => {
+                                if f.is_finite() {
+                                    JsonValue::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into()))
+                                } else {
+                                    JsonValue::Null
+                                }
+                            },
+                            SqlValue::Text(s) => JsonValue::String(s.clone()),
+                            SqlValue::Blob => JsonValue::String("BLOB".to_string()),
+                        }).collect::<Vec<_>>()
                     }).collect::<Vec<_>>()
-                }).collect::<Vec<_>>()
-            });
-            
-            json_results.push(json_value);
+                }))
+            })
+            .await
+            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+            json_results.push(results);
         }
 
         Ok(QueryResult {
