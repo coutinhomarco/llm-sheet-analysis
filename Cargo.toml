@@ -1,0 +1,46 @@
+[package]
+name = "sheet_services"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+# Web Framework
+axum = { version = "0.7", features = ["http1"] }
+tower-http = { version = "0.5", features = ["trace"] }
+hyper = { version = "1.0", features = ["server"] }
+
+# Error Handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Configuration
+dotenvy = "0.15"
+
+# Data Processing
+polars = { version = "0.37", features = ["lazy"] }
+calamine = "0.24"
+
+# Database (using rusqlite instead of sqlx)
+rusqlite = { version = "0.30", features = ["bundled"] }
+
+regex = "1.10"
+
+chrono = "0.4"
+
+rayon = "1.8"
+parking_lot = "0.12"
+once_cell = "1.18"
+
+[dev-dependencies]
+tokio-test = "0.4"
