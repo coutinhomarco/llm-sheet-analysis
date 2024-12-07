@@ -14,7 +14,6 @@ use async_openai::{
 use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::services::db_loader::DbLoader;
-use polars::datatypes::AnyValue;
 use rusqlite::types::ValueRef;
 use serde_json::Value as JsonValue;
 
@@ -57,17 +56,6 @@ enum SqlValue {
 }
 
 impl LlmAgent {
-    pub async fn new(api_key: &str) -> Result<Self, AppError> {
-        let config = OpenAIConfig::new().with_api_key(api_key);
-        let db_loader = DbLoader::new().await?;
-        
-        Ok(Self {
-            client: Client::with_config(config),
-            model: "gpt-4-turbo-preview".to_string(),
-            db_loader,
-        })
-    }
-
     pub fn new_with_loader(api_key: &str, db_loader: DbLoader) -> Result<Self, AppError> {
         let config = OpenAIConfig::new().with_api_key(api_key);
         
@@ -559,32 +547,6 @@ impl LlmAgent {
                 .into_iter()
                 .map(|q| q.replace('\u{0}', "").replace('\u{1F}', ""))
                 .collect(),
-        }
-    }
-
-    fn sanitize_string(&self, input: &str) -> String {
-        input
-            .replace('\u{0}', "")     // Null character
-            .replace('\u{1F}', "")    // Unit separator
-            .replace('\u{200B}', "")  // Zero-width space
-            .replace('\u{FEFF}', "")  // Zero-width non-breaking space
-            .trim()
-            .to_string()
-    }
-
-    fn any_value_to_json(value: &AnyValue) -> JsonValue {
-        match value {
-            AnyValue::Null => JsonValue::Null,
-            AnyValue::Int64(i) => JsonValue::Number((*i).into()),
-            AnyValue::Float64(f) => {
-                if f.is_finite() {
-                    JsonValue::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into()))
-                } else {
-                    JsonValue::Null
-                }
-            },
-            AnyValue::String(s) => JsonValue::String(s.to_string()),
-            _ => JsonValue::Null,
         }
     }
 
