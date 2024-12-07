@@ -1,9 +1,14 @@
 use anyhow::Result;
-use calamine::{Reader, Xlsx, open_workbook, Data};
+use calamine::{Reader, Xlsx, open_workbook, open_workbook_from_rs, Data};
 use polars::prelude::*;
 use std::path::Path;
 use crate::error::AppError;
 use regex::Regex;
+use std::io::Cursor;
+use polars::io::csv::CsvReader;
+use bytes::Bytes;
+use crate::services::db_loader::DbLoader;
+use reqwest::Client;
 
 #[derive(Debug)]
 pub struct ColumnInfo {
@@ -288,4 +293,300 @@ fn create_dataframe(rows: &[Vec<Data>], headers: &[String]) -> Result<DataFrame,
     
     DataFrame::new(columns)
         .map_err(|e| AppError::InvalidInput(format!("Failed to create DataFrame: {}", e)))
+}
+
+pub async fn process_csv_file(file_data: Bytes, db_loader: &DbLoader) -> Result<u32, AppError> {
+    tracing::info!("Processing CSV file");
+    let cursor = Cursor::new(file_data);
+    
+    let df = CsvReader::new(cursor)
+        .infer_schema(Some(100))
+        .has_header(true)
+        .finish()
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to read CSV: {}", e)))?;
+
+    let mut df = clean_dataframe(&df)
+        .ok_or_else(|| AppError::FileProcessingError("CSV file is empty after cleaning".to_string()))?;
+
+    // Detect and normalize date columns
+    let date_columns = detect_date_columns(&df);
+    df = normalize_date_columns(&mut df, &date_columns);
+
+    // Generate a unique table name
+    let table_name = format!("csv_data_{}", chrono::Utc::now().timestamp());
+    let clean_table_name = clean_table_name(&table_name);
+
+    // Load the data into SQLite
+    db_loader.load_dataframe(df, &clean_table_name).await?;
+
+    Ok(1) // Return 1 for one table processed
+}
+
+pub async fn process_excel_file(file_data: Bytes, file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
+    tracing::info!("Processing Excel file");
+    let cursor = Cursor::new(file_data);
+    
+    let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to open Excel file: {}", e)))?;
+
+    let mut total_tabs = 0;
+    let sheet_names = workbook.sheet_names().to_vec();
+
+    for sheet_name in &sheet_names {
+        match workbook.worksheet_range(sheet_name) {
+            Ok(range) => {
+                let rows: Vec<Vec<Data>> = range.rows().map(|row| row.to_vec()).collect();
+                
+                if rows.is_empty() {
+                    continue;
+                }
+
+                let headers = rows.first()
+                    .map(|row| row.iter()
+                        .map(|cell| clean_column_name(&cell.to_string()))
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                if let Ok(mut df) = create_dataframe(&rows, &headers) {
+                    if let Some(cleaned_df) = clean_dataframe(&df) {
+                        df = cleaned_df;
+                        
+                        // Detect and normalize date columns
+                        let date_columns = detect_date_columns(&df);
+                        df = normalize_date_columns(&mut df, &date_columns);
+
+                        // Generate a unique table name
+                        let table_name = format!("excel_{}_{}", clean_table_name(sheet_name), chrono::Utc::now().timestamp());
+                        
+                        // Load the data into SQLite
+                        if let Ok(()) = db_loader.load_dataframe(df, &table_name).await {
+                            total_tabs += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read worksheet {}: {}", sheet_name, e);
+                continue;
+            }
+        }
+    }
+
+    if total_tabs == 0 {
+        Err(AppError::FileProcessingError("No valid data found in Excel file".to_string()))
+    } else {
+        Ok(total_tabs)
+    }
+}
+
+fn clean_dataframe(df: &DataFrame) -> Option<DataFrame> {
+    if df.height() == 0 || df.width() == 0 {
+        return None;
+    }
+
+    // Drop rows where all values are null or empty
+    let df = df.drop_nulls::<String>(None)
+        .unwrap_or_else(|_| df.clone());
+
+    // Drop columns where all values are null
+    let df = df.select(
+        df.get_columns()
+            .iter()
+            .filter(|series| !series.is_empty() && !series.is_null().all())
+            .map(|series| series.name())
+            .collect::<Vec<_>>()
+    ).unwrap_or_else(|_| df.clone());
+
+    if df.height() == 0 || df.width() == 0 {
+        None
+    } else {
+        Some(df)
+    }
+}
+
+fn normalize_date_columns(df: &mut DataFrame, date_columns: &[String]) -> DataFrame {
+    for col_name in date_columns {
+        if let Ok(series) = df.column(col_name) {
+            if let Ok(dates) = series.cast(&DataType::Datetime(TimeUnit::Microseconds, None)) {
+                let _ = df.replace(col_name, dates);
+            }
+        }
+    }
+    df.clone()
+}
+
+fn detect_date_columns(df: &DataFrame) -> Vec<String> {
+    df.get_columns()
+        .iter()
+        .filter_map(|series| {
+            let name = series.name();
+            if is_date_series(series) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_date_series(series: &Series) -> bool {
+    match series.dtype() {
+        DataType::Date => true,
+        DataType::Datetime(_, _) => true,
+        DataType::String => {
+            // Sample first 100 non-null values and check if they match date patterns
+            let sample = series
+                .str()
+                .expect("Already checked it's a string series")
+                .into_iter()
+                .filter_map(|opt_str| opt_str)
+                .take(100);
+
+            let mut date_count = 0;
+            let mut total_count = 0;
+
+            for value in sample {
+                total_count += 1;
+                if is_date_string(&value) {
+                    date_count += 1;
+                }
+            }
+
+            total_count > 0 && (date_count as f64 / total_count as f64) >= 0.8
+        }
+        _ => false,
+    }
+}
+
+fn clean_table_name(name: &str) -> String {
+    let cleaned = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase();
+    
+    if cleaned.chars().next().map_or(true, |c| !c.is_alphabetic()) {
+        format!("tbl_{}", cleaned)
+    } else {
+        cleaned
+    }
+}
+
+pub async fn load_file_from_url(url: &str) -> Result<Bytes, AppError> {
+    let client = Client::new();
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to fetch file: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::FileProcessingError(
+            format!("Failed to fetch file. Status: {}", response.status())
+        ));
+    }
+
+    response
+        .bytes()
+        .await
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to read response bytes: {}", e)))
+}
+
+pub async fn process_file_from_url(url: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
+    let file_extension = url
+        .split('.')
+        .last()
+        .ok_or_else(|| AppError::FileProcessingError("Invalid file URL".to_string()))?;
+
+    let file_data = load_file_from_url(url).await?;
+
+    match file_extension.to_lowercase().as_str() {
+        "csv" => process_csv_file(file_data, db_loader).await,
+        "xlsx" | "xls" => process_excel_file(file_data, file_extension, db_loader).await,
+        _ => Err(AppError::FileProcessingError("Unsupported file type".to_string()))
+    }
+}
+
+pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, AppError> {
+    tracing::info!("Starting file analysis from URL");
+    let start = std::time::Instant::now();
+
+    let file_data = load_file_from_url(url).await?;
+    let cursor = Cursor::new(file_data);
+    
+    // Open workbook
+    let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to open Excel file: {}", e)))?;
+    
+    let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
+    
+    if let Some(sheet_name) = sheet_names.first() {
+        let worksheets = workbook.worksheets();
+        if let Some((_, range)) = worksheets.into_iter().find(|(name, _)| name == sheet_name) {
+            // Get only first 1000 rows for analysis
+            let rows: Vec<Vec<Data>> = range.rows()
+                .take(1000)
+                .map(|row| row.to_vec())
+                .collect();
+
+            let row_count = rows.len();
+            let column_count = rows.first().map_or(0, |r| r.len());
+            
+            let headers = rows.first()
+                .map(|row| row.iter()
+                    .map(|cell| clean_column_name(&cell.to_string()))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            // Quick column type detection
+            let mut date_columns = Vec::new();
+            let mut numeric_columns = Vec::new();
+            let mut text_columns = Vec::new();
+            
+            // Take sample rows for analysis
+            let sample_data: Vec<Vec<String>> = rows.iter()
+                .take(5)
+                .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+                .collect();
+
+            // Basic column analysis
+            let column_info = headers.iter().enumerate()
+                .map(|(idx, name)| {
+                    let values: Vec<Data> = rows.iter()
+                        .skip(1)
+                        .take(100) // Only analyze first 100 rows for type detection
+                        .map(|row| row.get(idx).cloned().unwrap_or(Data::Empty))
+                        .collect();
+                    
+                    let data_type = detect_column_type(&values);
+                    match data_type.as_str() {
+                        "date" => date_columns.push(name.clone()),
+                        "numeric" => numeric_columns.push(name.clone()),
+                        "string" => text_columns.push(name.clone()),
+                        _ => {}
+                    }
+                    
+                    analyze_column(&values, name)
+                })
+                .collect();
+
+            tracing::info!("Analysis completed in {:?}", start.elapsed());
+            
+            Ok(SheetAnalysis {
+                sheet_names,
+                row_count,
+                column_count,
+                sample_data,
+                column_info,
+                dataframe: None,
+                date_columns,
+                numeric_columns,
+                text_columns,
+            })
+        } else {
+            Err(AppError::FileProcessingError("Failed to read worksheet".to_string()))
+        }
+    } else {
+        Err(AppError::FileProcessingError("No sheets found in workbook".to_string()))
+    }
 }
