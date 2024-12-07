@@ -1,11 +1,9 @@
 use anyhow::Result;
-use calamine::{Reader, Xlsx, open_workbook, open_workbook_from_rs, Data};
+use calamine::{Reader, Xlsx, open_workbook_from_rs, Data};
 use polars::prelude::*;
-use std::path::Path;
 use crate::error::AppError;
 use regex::Regex;
 use std::io::Cursor;
-use polars::io::csv::CsvReader;
 use bytes::Bytes;
 use crate::services::db_loader::DbLoader;
 use reqwest::Client;
@@ -13,9 +11,9 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
-const SAMPLE_SIZE: usize = 5;
-const TYPE_DETECTION_ROWS: usize = 100;
-const MAX_ANALYSIS_ROWS: usize = 1000;
+const SAMPLE_SIZE: usize = 3;
+const TYPE_DETECTION_ROWS: usize = 50;
+// const MAX_ANALYSIS_ROWS: usize = 1000;
 
 #[derive(Debug)]
 pub struct ColumnInfo {
@@ -142,120 +140,28 @@ fn analyze_column(values: &[Data], name: &str) -> ColumnInfo {
     }
 }
 
-pub async fn analyze_excel_file<P: AsRef<Path>>(path: P) -> Result<SheetAnalysis, AppError> {
-    let path_ref = path.as_ref();
-    
-    tracing::info!("Starting file analysis");
-    let start = std::time::Instant::now();
-
-    // Basic file checks
-    if !path_ref.exists() {
-        return Err(AppError::InvalidInput(format!("File does not exist: {:?}", path_ref)));
-    }
-
-    // Open workbook
-    let mut workbook: Xlsx<_> = open_workbook(path_ref)
-        .map_err(|e| AppError::InvalidInput(format!("Failed to open Excel file: {}", e)))?;
-    
-    let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
-    
-    if let Some(sheet_name) = sheet_names.first() {
-        let worksheets = workbook.worksheets();
-        if let Some((_, range)) = worksheets.into_iter().find(|(name, _)| name == sheet_name) {
-            // Get only first 1000 rows for analysis
-            let rows: Vec<Vec<Data>> = range.rows()
-                .take(1000)
-                .map(|row| row.to_vec())
-                .collect();
-
-            let row_count = rows.len();
-            let column_count = rows.first().map_or(0, |r| r.len());
-            
-            let headers = rows.first()
-                .map(|row| row.iter()
-                    .map(|cell| clean_column_name(&cell.to_string()))
-                    .collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            // Quick column type detection
-            let mut date_columns: Vec<String> = Vec::new();
-            let mut numeric_columns: Vec<String> = Vec::new();
-            let mut text_columns: Vec<String> = Vec::new();
-            
-            // Take sample rows for analysis
-            let sample_data: Vec<Vec<String>> = rows.iter()
-                .take(5)
-                .map(|row| row.iter().map(|cell| cell.to_string()).collect())
-                .collect();
-
-            // Basic column analysis
-            let (column_info, date_cols, numeric_cols, text_cols) = headers.par_iter().enumerate()
-            .fold(
-                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                |mut acc, (idx, name)| {
-                    let values: Vec<Data> = rows.iter()
-                        .skip(1)
-                        .take(TYPE_DETECTION_ROWS)
-                        .filter_map(|row| row.get(idx).cloned())
-                        .collect();
-                    
-                    let info = analyze_column(&values, name);
-                    match info.data_type.as_str() {
-                        "date" => acc.1.push(name.clone()),
-                        "numeric" => acc.2.push(name.clone()),
-                        "string" => acc.3.push(name.clone()),
-                        _ => {}
-                    }
-                    acc.0.push(info);
-                    acc
-                }
-            )
-            .reduce(
-                || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                |mut a, b| {
-                    a.0.extend(b.0);
-                    a.1.extend(b.1);
-                    a.2.extend(b.2);
-                    a.3.extend(b.3);
-                    a
-                }
-            );
-
-            tracing::info!("Analysis completed FILEPROCESSOR 216 in {:?}", start.elapsed());
-            
-            let df = create_dataframe(&rows, &headers)?;
-            
-            Ok(SheetAnalysis {
-                sheet_names: sheet_names,
-                row_count,
-                column_count,
-                sample_data: sample_data,
-                column_info: column_info,
-                dataframe: Some(df),
-                date_columns: date_cols,
-                numeric_columns: numeric_cols,
-                text_columns: text_cols,
-            })
-        } else {
-            Err(AppError::InvalidInput("Failed to read worksheet".to_string()))
-        }
-    } else {
-        Err(AppError::InvalidInput("No sheets found in workbook".to_string()))
-    }
-}
-
-fn clean_column_name(name: &str) -> String {
-    let cleaned = name
+fn clean_column_name(name: &str, existing_names: &mut HashSet<String>) -> String {
+    let base_name = name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect::<String>()
         .to_lowercase();
     
-    if cleaned.chars().next().map_or(true, |c| !c.is_alphabetic()) {
-        format!("col_{}", cleaned)
+    let mut cleaned = if base_name.chars().next().map_or(true, |c| !c.is_alphabetic()) {
+        format!("col_{}", base_name)
     } else {
-        cleaned
+        base_name
+    };
+
+    // If the name already exists, add a numeric suffix
+    let mut counter = 1;
+    let original_name = cleaned.clone();
+    while !existing_names.insert(cleaned.clone()) {
+        cleaned = format!("{}_{}", original_name, counter);
+        counter += 1;
     }
+
+    cleaned
 }
 
 fn create_dataframe(rows: &[Vec<Data>], headers: &[String]) -> Result<DataFrame, AppError> {
@@ -305,33 +211,6 @@ fn create_dataframe(rows: &[Vec<Data>], headers: &[String]) -> Result<DataFrame,
         .map_err(|e| AppError::InvalidInput(format!("Failed to create DataFrame: {}", e)))
 }
 
-pub async fn process_csv_file(file_data: Bytes, db_loader: &DbLoader) -> Result<u32, AppError> {
-    tracing::info!("Processing CSV file");
-    let cursor = Cursor::new(file_data);
-    
-    let df = CsvReader::new(cursor)
-        .infer_schema(Some(100))
-        .has_header(true)
-        .finish()
-        .map_err(|e| AppError::FileProcessingError(format!("Failed to read CSV: {}", e)))?;
-
-    let mut df = clean_dataframe(&df)
-        .ok_or_else(|| AppError::FileProcessingError("CSV file is empty after cleaning".to_string()))?;
-
-    // Detect and normalize date columns
-    let date_columns = detect_date_columns(&df);
-    df = normalize_date_columns(&mut df, &date_columns);
-
-    // Generate a unique table name
-    let table_name = format!("csv_data_{}", chrono::Utc::now().timestamp());
-    let clean_table_name = clean_table_name(&table_name);
-
-    // Load the data into SQLite
-    db_loader.load_dataframe(df, &clean_table_name).await?;
-
-    Ok(1) // Return 1 for one table processed
-}
-
 pub async fn process_excel_file(file_data: Bytes, _file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
     tracing::info!("Processing Excel file");
     let cursor = Cursor::new(file_data);
@@ -341,37 +220,56 @@ pub async fn process_excel_file(file_data: Bytes, _file_extension: &str, db_load
 
     let mut total_tabs = 0;
     let sheet_names = workbook.sheet_names().to_vec();
+    tracing::info!("Processing {} sheets", sheet_names.len());
 
     for sheet_name in &sheet_names {
+        tracing::info!("Processing sheet: {}", sheet_name);
         match workbook.worksheet_range(sheet_name) {
             Ok(range) => {
                 let rows: Vec<Vec<Data>> = range.rows().map(|row| row.to_vec()).collect();
                 
                 if rows.is_empty() {
+                    tracing::warn!("Sheet {} is empty, skipping", sheet_name);
                     continue;
                 }
 
+                let mut existing_names = HashSet::new();
                 let headers = rows.first()
                     .map(|row| row.iter()
-                        .map(|cell| clean_column_name(&cell.to_string()))
+                        .map(|cell| clean_column_name(&cell.to_string(), &mut existing_names))
                         .collect::<Vec<_>>())
                     .unwrap_or_default();
 
-                if let Ok(mut df) = create_dataframe(&rows, &headers) {
-                    if let Some(cleaned_df) = clean_dataframe(&df) {
-                        df = cleaned_df;
-                        
-                        // Detect and normalize date columns
-                        let date_columns = detect_date_columns(&df);
-                        df = normalize_date_columns(&mut df, &date_columns);
+                tracing::info!("Creating dataframe for sheet {} with {} rows", sheet_name, rows.len());
+                match create_dataframe(&rows, &headers) {
+                    Ok(mut df) => {
+                        if let Some(cleaned_df) = clean_dataframe(&df) {
+                            df = cleaned_df;
+                            
+                            // Detect and normalize date columns
+                            let date_columns = detect_date_columns(&df);
+                            df = normalize_date_columns(&mut df, &date_columns);
 
-                        // Generate a unique table name
-                        let table_name = format!("excel_{}_{}", clean_table_name(sheet_name), chrono::Utc::now().timestamp());
-                        
-                        // Load the data into SQLite
-                        if let Ok(()) = db_loader.load_dataframe(df, &table_name).await {
-                            total_tabs += 1;
+                            // Generate a unique table name
+                            let table_name = format!("excel_{}_{}", clean_table_name(sheet_name), chrono::Utc::now().timestamp());
+                            tracing::info!("Loading sheet {} into table {}", sheet_name, table_name);
+                            
+                            // Load the data into SQLite
+                            match db_loader.load_dataframe(df, &table_name).await {
+                                Ok(()) => {
+                                    total_tabs += 1;
+                                    tracing::info!("Successfully loaded sheet {} into database", sheet_name);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to load sheet {} into database: {}", sheet_name, e);
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Sheet {} produced empty dataframe after cleaning", sheet_name);
                         }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create dataframe for sheet {}: {}", sheet_name, e);
                     }
                 }
             }
@@ -383,8 +281,10 @@ pub async fn process_excel_file(file_data: Bytes, _file_extension: &str, db_load
     }
 
     if total_tabs == 0 {
+        tracing::error!("No valid data found in Excel file after processing all sheets");
         Err(AppError::FileProcessingError("No valid data found in Excel file".to_string()))
     } else {
+        tracing::info!("Successfully processed {} sheets", total_tabs);
         Ok(total_tabs)
     }
 }
@@ -502,33 +402,23 @@ pub async fn load_file_from_url(url: &str) -> Result<Bytes, AppError> {
         .map_err(|e| AppError::FileProcessingError(format!("Failed to read response bytes: {}", e)))
 }
 
-pub async fn process_file_from_url(url: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
-    let file_extension = url
-        .split('.')
-        .last()
-        .ok_or_else(|| AppError::FileProcessingError("Invalid file URL".to_string()))?;
-
-    let file_data = load_file_from_url(url).await?;
-
-    match file_extension.to_lowercase().as_str() {
-        "csv" => process_csv_file(file_data, db_loader).await,
-        "xlsx" | "xls" => process_excel_file(file_data, file_extension, db_loader).await,
-        _ => Err(AppError::FileProcessingError("Unsupported file type".to_string()))
-    }
-}
-
-pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, AppError> {
-    tracing::info!("Starting file analysis from URL");
+pub async fn analyze_excel_file_from_bytes(file_data: Bytes) -> Result<SheetAnalysis, AppError> {
     let start = std::time::Instant::now();
-
-    let file_data = load_file_from_url(url).await?;
+    tracing::info!("Starting Excel file analysis from bytes");
+    
     let cursor = Cursor::new(file_data);
     
-    // Open workbook
+    tracing::info!("Opening workbook...");
+    let workbook_start = std::time::Instant::now();
     let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
-        .map_err(|e| AppError::FileProcessingError(format!("Failed to open Excel file: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Failed to open Excel file: {}", e);
+            AppError::FileProcessingError(format!("Failed to open Excel file: {}", e))
+        })?;
+    tracing::info!("Workbook opened in {:?}", workbook_start.elapsed());
     
     let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
+    tracing::info!("Found {} sheets: {:?}", sheet_names.len(), sheet_names);
     
     if let Some(sheet_name) = sheet_names.first() {
         let worksheets = workbook.worksheets();
@@ -542,9 +432,10 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
             let row_count = rows.len();
             let column_count = rows.first().map_or(0, |r| r.len());
             
+            let mut existing_names = HashSet::new();
             let headers = rows.first()
                 .map(|row| row.iter()
-                    .map(|cell| clean_column_name(&cell.to_string()))
+                    .map(|cell| clean_column_name(&cell.to_string(), &mut existing_names))
                     .collect::<Vec<_>>())
                 .unwrap_or_default();
 
@@ -599,33 +490,6 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
     } else {
         Err(AppError::FileProcessingError("No sheets found in workbook".to_string()))
     }
-}
-
-pub async fn process_file(file_bytes: &[u8], _file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
-    tracing::info!("Processing file");
-    let cursor = Cursor::new(file_bytes);
-    
-    let df = CsvReader::new(cursor)
-        .infer_schema(Some(100))
-        .has_header(true)
-        .finish()
-        .map_err(|e| AppError::FileProcessingError(format!("Failed to read CSV: {}", e)))?;
-
-    let mut df = clean_dataframe(&df)
-        .ok_or_else(|| AppError::FileProcessingError("CSV file is empty after cleaning".to_string()))?;
-
-    // Detect and normalize date columns
-    let date_columns = detect_date_columns(&df);
-    df = normalize_date_columns(&mut df, &date_columns);
-
-    // Generate a unique table name
-    let table_name = format!("csv_data_{}", chrono::Utc::now().timestamp());
-    let clean_table_name = clean_table_name(&table_name);
-
-    // Load the data into SQLite
-    db_loader.load_dataframe(df, &clean_table_name).await?;
-
-    Ok(1) // Return 1 for one table processed
 }
 
 fn update_min_max(min_max: &mut (Option<String>, Option<String>), value: &str) {

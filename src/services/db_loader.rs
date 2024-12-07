@@ -3,12 +3,12 @@ use tokio::sync::Mutex;
 use moka::sync::Cache;
 use polars::prelude::*;
 use crate::error::AppError;
-use tracing::{info, debug, error, warn};
+use tracing::{info, debug, warn};
 use std::time::Duration;
 use rusqlite::types::ValueRef;
 use std::sync::Arc;
 
-const BATCH_SIZE: usize = 1000;
+const BATCH_SIZE: usize = 300;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const CACHE_CAPACITY: u64 = 100;
 

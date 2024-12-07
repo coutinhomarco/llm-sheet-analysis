@@ -2,11 +2,6 @@ use serde::Deserialize;
 use anyhow::Result;
 use dotenvy::dotenv;
 
-fn default_max_file_size() -> usize {
-    // 10 MB in bytes
-    10 * 1024 * 1024
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub max_file_size: usize,
