@@ -14,6 +14,9 @@ use async_openai::{
 use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::services::db_loader::DbLoader;
+use polars::datatypes::{AnyValue, DataType};
+use rusqlite::types::ValueRef;
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentResponse {
@@ -32,10 +35,25 @@ pub struct TeddyJsonObject {
     pub queries: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct QueryResult {
+    pub comment: String,
+    pub data: Vec<JsonValue>,
+}
+
 pub struct LlmAgent {
     client: Client<OpenAIConfig>,
     model: String,
     db_loader: DbLoader,
+}
+
+#[derive(Debug)]
+enum SqlValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob,
 }
 
 impl LlmAgent {
@@ -74,8 +92,7 @@ impl LlmAgent {
         // Sanitize Teddy's response
         let sanitized_response = self.sanitize_values(teddy_response);
         
-        // Finally, validate the analysis
-        self.validate_analysis(sanitized_response, &schema).await
+        Ok(sanitized_response)
     }
 
     async fn call_dolores(&self, messages: &[String]) -> Result<DoloresResponse, AppError> {
@@ -317,7 +334,11 @@ impl LlmAgent {
             YOU MUST strictly follow the instructions provided to YOU and generate SQL Lite queries that retrieve the necessary data from the database.
 
             **IMPORTANT**:
-            - YOU MUST ONLY return the SQL Lite queries, the comment (if necessary) and NOTHING ELSE.
+            -         - YOU MUST ALWAYS return a JSON object with the following structure:
+          {{
+            "comment": "A description of what the query does",
+            "queries": ["SQL query string 1", "SQL query string 2", ...]
+          }}
             - IT IS CRUCIAL that you generate an accurate query using the database schema provided.
 
             **DATABASE SCHEMA AND SAMPLE DATA**:
@@ -454,7 +475,19 @@ impl LlmAgent {
                 - For example, if you receive the date and time as 2024-01-10 09:00:00' or '2024-01-10 10:00:00, you must use the format BETWEEN '2024-01-10 09:00:00' AND '2024-10-10 10:00:00', and so on.
               - Make sure to ALWAYS evaluate the user request and use the best operators and keywords in SQLite to perform that task.
 
-              **YOUR GOAL**:
+                
+            !**RESPONSE FORMAT**:
+                YOU MUST ALWAYS return your response in this exact JSON format:
+                {{
+                "comment": "Description of what the queries do",
+                "queries": [
+                    "SELECT ... FROM ...",
+                    "Another SQL query if needed"
+                ]
+                }}
+                
+                
+                **YOUR GOAL**:
               - YOU MUST ENSURE the SQL Lite query accurately fulfills the data request by the user, and the query MUST be based on the columns in the provided schema.
               - YOU MUST transform the result columns into the BEST DESCRIPTIVE NAMES possible in Brazilian Portuguese to improve readability and understanding of the output. However, if all columns are being selected, then just use SELECT *
               - YOU MUST ALWAYS make sure the queries you generate are ALWAYS correct and within SQL Lite norms."#,
@@ -529,75 +562,6 @@ impl LlmAgent {
         }
     }
 
-    async fn validate_analysis(&self, response: AgentResponse, schema: &str) -> Result<AgentResponse, AppError> {
-        let validation_prompt = format!(
-            r#"Given these SQL queries and their explanation:
-            Comment: {}
-            Queries:
-            {}
-
-            And this database schema:
-            {}
-
-            Please validate:
-            1. Do the queries match the schema?
-            2. Will they provide meaningful insights?
-            3. Are there any potential issues or improvements?
-
-            If everything looks good, return the original response.
-            If there are issues, modify the response to fix them.
-
-            Respond in JSON format with the same structure:
-            {{
-                "comment": "string",
-                "queries": ["string"]
-            }}"#,
-            response.comment,
-            response.queries.join("\n"),
-            schema
-        );
-
-        let messages = vec![
-            ChatCompletionRequestMessage::System(
-                ChatCompletionRequestSystemMessage {
-                    content: "You are a SQL expert. Validate and improve SQL queries.".to_string(),
-                    name: None,
-                    role: Role::System,
-                }
-            ),
-            ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(validation_prompt),
-                    name: None,
-                    role: Role::User,
-                }
-            ),
-        ];
-
-        let request = CreateChatCompletionRequest {
-            model: self.model.clone(),
-            messages,
-            temperature: Some(0.1),
-            ..Default::default()
-        };
-
-        let llm_response = self.client
-            .chat()
-            .create(request)
-            .await
-            .map_err(|e| AppError::LlmError(e.to_string()))?;
-
-        let content = llm_response.choices[0]
-            .message
-            .content
-            .clone()
-            .unwrap_or_default();
-
-        // Parse and sanitize the validation response
-        let validated_response = self.parse_teddy_response(&content)?;
-        Ok(self.sanitize_values(validated_response))
-    }
-
     fn sanitize_string(&self, input: &str) -> String {
         input
             .replace('\u{0}', "")     // Null character
@@ -606,5 +570,94 @@ impl LlmAgent {
             .replace('\u{FEFF}', "")  // Zero-width non-breaking space
             .trim()
             .to_string()
+    }
+
+    fn any_value_to_json(value: &AnyValue) -> JsonValue {
+        match value {
+            AnyValue::Null => JsonValue::Null,
+            AnyValue::Int64(i) => JsonValue::Number((*i).into()),
+            AnyValue::Float64(f) => {
+                if f.is_finite() {
+                    JsonValue::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into()))
+                } else {
+                    JsonValue::Null
+                }
+            },
+            AnyValue::String(s) => JsonValue::String(s.to_string()),
+            _ => JsonValue::Null,
+        }
+    }
+
+    pub async fn execute_queries(&self, response: AgentResponse) -> Result<QueryResult, AppError> {
+        let mut json_results = Vec::new();
+        
+        if response.queries.is_empty() {
+            return Ok(QueryResult {
+                comment: response.comment,
+                data: json_results,
+            });
+        }
+
+        let conn = self.db_loader.get_connection()?;
+        
+        for sql_query in response.queries {
+            tracing::info!("Executing SQL query: {}", sql_query);
+            
+            let mut stmt = conn.prepare(&sql_query).map_err(|e| {
+                AppError::DatabaseError(format!("Failed to prepare query: {}", e))
+            })?;
+            
+            let column_names: Vec<String> = stmt
+                .column_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            
+            let column_count = stmt.column_count();
+            let mut rows_data = Vec::new();
+            
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let mut row_values = Vec::new();
+                for i in 0..column_count {
+                    let value = match row.get_ref(i)? {
+                        ValueRef::Null => SqlValue::Null,
+                        ValueRef::Integer(i) => SqlValue::Integer(i),
+                        ValueRef::Real(f) => SqlValue::Float(f),
+                        ValueRef::Text(t) => SqlValue::Text(String::from_utf8_lossy(t).into_owned()),
+                        ValueRef::Blob(_) => SqlValue::Blob,
+                    };
+                    row_values.push(value);
+                }
+                rows_data.push(row_values);
+            }
+
+            // Convert to JSON
+            let json_value = serde_json::json!({
+                "columns": column_names,
+                "rows": rows_data.iter().map(|row| {
+                    row.iter().map(|value| match value {
+                        SqlValue::Null => JsonValue::Null,
+                        SqlValue::Integer(i) => JsonValue::Number((*i).into()),
+                        SqlValue::Float(f) => {
+                            if f.is_finite() {
+                                JsonValue::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into()))
+                            } else {
+                                JsonValue::Null
+                            }
+                        },
+                        SqlValue::Text(s) => JsonValue::String(s.clone()),
+                        SqlValue::Blob => JsonValue::String("BLOB".to_string()),
+                    }).collect::<Vec<_>>()
+                }).collect::<Vec<_>>()
+            });
+            
+            json_results.push(json_value);
+        }
+
+        Ok(QueryResult {
+            comment: response.comment,
+            data: json_results,
+        })
     }
 }

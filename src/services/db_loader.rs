@@ -300,4 +300,10 @@ impl DbLoader {
         
         has_table && has_columns
     }
+
+    pub fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AppError> {
+        self.conn.lock().map_err(|e| {
+            AppError::DatabaseError(format!("Failed to acquire database lock: {}", e))
+        })
+    }
 }

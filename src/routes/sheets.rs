@@ -12,7 +12,7 @@ use crate::{
     services::{
         file_processor,
         db_loader::DbLoader,
-        llm_agent::{LlmAgent, AgentResponse}
+        llm_agent::{LlmAgent, QueryResult}
     }
 };
 
@@ -57,7 +57,7 @@ pub struct AnalyzeResponse {
 #[derive(Debug, Serialize)]
 pub struct FullAnalysisResponse {
     analysis: AnalyzeResponse,
-    tool_result: AgentResponse,
+    tool_result: QueryResult,
     new_file_url: Option<String>,
 }
 
@@ -88,7 +88,8 @@ async fn analyze_sheet(
     let llm_agent = LlmAgent::new_with_loader(&state.config.openai_key, db_loader)?;
     let messages = request.messages.unwrap_or_default();
     let agent_response = llm_agent.generate_analysis(&messages).await?;
-    tracing::info!("Analysis completed SHEET.RS 91 in {:?}", start.elapsed());
+    let query_result = llm_agent.execute_queries(agent_response).await?;
+    tracing::info!("Analysis completed in {:?}", start.elapsed());
 
     Ok(Json(FullAnalysisResponse {
         analysis: AnalyzeResponse {
@@ -112,7 +113,7 @@ async fn analyze_sheet(
             numeric_columns: analysis.numeric_columns,
             text_columns: analysis.text_columns,
         },
-        tool_result: agent_response,
+        tool_result: query_result,
         new_file_url: None,
     }))
 }

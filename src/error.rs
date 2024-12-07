@@ -18,6 +18,7 @@ pub enum AppError {
     Database(String),
     HttpError(String),
     FileProcessingError(String),
+    DataFrameError(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -34,6 +35,7 @@ impl std::fmt::Display for AppError {
             AppError::AwsS3(msg) => write!(f, "AWS S3 error: {}", msg),
             AppError::Database(msg) => write!(f, "Database error: {}", msg),
             AppError::FileProcessingError(msg) => write!(f, "File processing error: {}", msg),
+            AppError::DataFrameError(msg) => write!(f, "DataFrame error: {}", msg),
         }
     }
 }
@@ -72,6 +74,7 @@ impl IntoResponse for AppError {
             AppError::AwsS3(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             AppError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             AppError::FileProcessingError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            AppError::DataFrameError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         let body = Json(json!({
