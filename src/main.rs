@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
-
+use crate::config::Config;
 mod config;
 mod error;
 mod logging;
@@ -17,9 +17,9 @@ async fn main() -> Result<()> {
     logging::init_logging()?;
     
     // Load configuration
-    let config = config::load_config()?;
+    let config = Config::new()?;
     
-    // Build our application state
+    // Create app state
     let state = Arc::new(AppState::new(config));
     
     // Build our application with a route
@@ -40,11 +40,11 @@ async fn main() -> Result<()> {
 // Application state
 #[derive(Clone)]
 pub struct AppState {
-    config: config::Config,
+    pub config: Config,
 }
 
 impl AppState {
-    fn new(config: config::Config) -> Self {
+    pub fn new(config: Config) -> Self {
         Self { config }
     }
 }

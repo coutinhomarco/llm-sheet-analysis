@@ -8,7 +8,7 @@ edition = "2021"
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 # Web Framework
-axum = { version = "0.7", features = ["http1"] }
+axum = { version = "0.7", features = ["http1", "macros"] }
 tower-http = { version = "0.5", features = ["trace"] }
 hyper = { version = "1.0", features = ["server"] }
 
@@ -46,3 +46,4 @@ bytes = "1.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
+dotenvy = "0.15"

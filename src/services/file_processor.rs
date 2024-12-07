@@ -213,7 +213,9 @@ pub async fn analyze_excel_file<P: AsRef<Path>>(path: P) -> Result<SheetAnalysis
                 })
                 .collect();
 
-            tracing::info!("Analysis completed in {:?}", start.elapsed());
+            tracing::info!("Analysis completed FILEPROCESSOR 216 in {:?}", start.elapsed());
+            
+            let df = create_dataframe(&rows, &headers)?;
             
             Ok(SheetAnalysis {
                 sheet_names,
@@ -221,7 +223,7 @@ pub async fn analyze_excel_file<P: AsRef<Path>>(path: P) -> Result<SheetAnalysis
                 column_count,
                 sample_data,
                 column_info,
-                dataframe: None, // Skip DataFrame creation for now
+                dataframe: Some(df),
                 date_columns,
                 numeric_columns,
                 text_columns,
@@ -322,7 +324,7 @@ pub async fn process_csv_file(file_data: Bytes, db_loader: &DbLoader) -> Result<
     Ok(1) // Return 1 for one table processed
 }
 
-pub async fn process_excel_file(file_data: Bytes, file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
+pub async fn process_excel_file(file_data: Bytes, _file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
     tracing::info!("Processing Excel file");
     let cursor = Cursor::new(file_data);
     
@@ -570,7 +572,7 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
                 })
                 .collect();
 
-            tracing::info!("Analysis completed in {:?}", start.elapsed());
+            tracing::info!("Analysis completed FILEPROCESSOR 575 in {:?}", start.elapsed());
             
             Ok(SheetAnalysis {
                 sheet_names,
@@ -589,4 +591,31 @@ pub async fn analyze_excel_file_from_url(url: &str) -> Result<SheetAnalysis, App
     } else {
         Err(AppError::FileProcessingError("No sheets found in workbook".to_string()))
     }
+}
+
+pub async fn process_file(file_bytes: &[u8], _file_extension: &str, db_loader: &DbLoader) -> Result<u32, AppError> {
+    tracing::info!("Processing file");
+    let cursor = Cursor::new(file_bytes);
+    
+    let df = CsvReader::new(cursor)
+        .infer_schema(Some(100))
+        .has_header(true)
+        .finish()
+        .map_err(|e| AppError::FileProcessingError(format!("Failed to read CSV: {}", e)))?;
+
+    let mut df = clean_dataframe(&df)
+        .ok_or_else(|| AppError::FileProcessingError("CSV file is empty after cleaning".to_string()))?;
+
+    // Detect and normalize date columns
+    let date_columns = detect_date_columns(&df);
+    df = normalize_date_columns(&mut df, &date_columns);
+
+    // Generate a unique table name
+    let table_name = format!("csv_data_{}", chrono::Utc::now().timestamp());
+    let clean_table_name = clean_table_name(&table_name);
+
+    // Load the data into SQLite
+    db_loader.load_dataframe(df, &clean_table_name).await?;
+
+    Ok(1) // Return 1 for one table processed
 }
