@@ -130,7 +130,7 @@ async fn analyze_sheet(
     // 5. Process Excel file and load into database
     tracing::info!("Loading data into database...");
     let db_load_start = std::time::Instant::now();
-    let tables_created = file_processor::process_excel_file(file_data, "xlsx", &db_loader).await?;
+    let tables_created = file_processor::process_excel_file(file_data, &db_loader).await?;
     tracing::info!("Created {} tables in database in {:?}", tables_created, db_load_start.elapsed());
     
     // 6. Generate LLM analysis
