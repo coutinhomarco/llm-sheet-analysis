@@ -75,18 +75,25 @@ impl DbLoader {
                 .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
             tx.execute(&create_table_sql, [])?;
 
-            // Generate insert SQL statement
-            let insert_sql = this.generate_insert_sql(&table_name, &df)
-                .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            // Generate simpler insert SQL with just one row of placeholders
+            let columns = df.get_column_names();
+            let placeholders = vec!["?"; df.width()].join(", ");
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                table_name,
+                columns.join(", "),
+                placeholders
+            );
 
-            // Process in batches
-            let total_rows = df.height();
-            for chunk_start in (0..total_rows).step_by(BATCH_SIZE) {
-                let chunk_end = (chunk_start + BATCH_SIZE).min(total_rows);
-                debug!("Processing batch {}-{}/{}", chunk_start, chunk_end, total_rows);
+            {
+                let mut stmt = tx.prepare(&insert_sql)?;
+                
+                // Process in batches
+                let total_rows = df.height();
+                for chunk_start in (0..total_rows).step_by(BATCH_SIZE) {
+                    let chunk_end = (chunk_start + BATCH_SIZE).min(total_rows);
+                    debug!("Processing batch {}-{}/{}", chunk_start, chunk_end, total_rows);
 
-                {
-                    let mut stmt = tx.prepare(&insert_sql)?;
                     for row_idx in chunk_start..chunk_end {
                         let params = this.prepare_row_params(&df, row_idx)
                             .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
@@ -97,10 +104,9 @@ impl DbLoader {
 
                         stmt.execute(param_refs.as_slice())?;
                     }
-                } // stmt is dropped here, releasing the borrow on tx
+                }
             }
-
-            // Now we can safely commit
+            
             tx.commit()?;
             Ok(())
         })
@@ -109,27 +115,27 @@ impl DbLoader {
     }
 
     fn prepare_row_params(&self, df: &DataFrame, row_idx: usize) -> Result<Vec<Box<dyn rusqlite::ToSql>>, AppError> {
-        df.get_columns()
-            .iter()
-            .map(|series| {
-                Ok(match series.get(row_idx) {
-                    Ok(value) => match value {
-                        AnyValue::Null => Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::Int32(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::Int64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::Float32(v) => Box::new(v as f64) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::Float64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::String(v) => Box::new(v.to_string()) as Box<dyn rusqlite::ToSql>,
-                        AnyValue::Boolean(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
-                        _ => Box::new(value.to_string()) as Box<dyn rusqlite::ToSql>,
-                    },
-                    Err(e) => {
-                        warn!("Error getting value at row {}: {}", row_idx, e);
-                        Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>
-                    }
-                })
-            })
-            .collect()
+        let mut params = Vec::with_capacity(df.width());
+        for series in df.get_columns() {
+            let value = match series.get(row_idx) {
+                Ok(value) => match value {
+                    AnyValue::Null => Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::Int32(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::Int64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::Float32(v) => Box::new(v as f64) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::Float64(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::String(v) => Box::new(v.to_string()) as Box<dyn rusqlite::ToSql>,
+                    AnyValue::Boolean(v) => Box::new(v) as Box<dyn rusqlite::ToSql>,
+                    _ => Box::new(value.to_string()) as Box<dyn rusqlite::ToSql>,
+                },
+                Err(e) => {
+                    warn!("Error getting value at row {}: {}", row_idx, e);
+                    Box::new(rusqlite::types::Null) as Box<dyn rusqlite::ToSql>
+                }
+            };
+            params.push(value);
+        }
+        Ok(params)
     }
 
     pub async fn get_schema_with_samples(&self) -> Result<String, AppError> {
@@ -232,18 +238,6 @@ impl DbLoader {
             "CREATE TABLE IF NOT EXISTS {} ({})",
             table_name,
             columns.join(", ")
-        ))
-    }
-
-    fn generate_insert_sql(&self, table_name: &str, df: &DataFrame) -> Result<String, AppError> {
-        let columns = df.get_column_names();
-        let placeholders = vec!["?"; columns.len()].join(", ");
-        
-        Ok(format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table_name,
-            columns.join(", "),
-            placeholders
         ))
     }
 
