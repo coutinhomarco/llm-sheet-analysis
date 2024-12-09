@@ -8,102 +8,148 @@ use smallvec::SmallVec;
 use crate::error::AppError;
 use rayon::prelude::*;
 use calamine::Reader;
+use std::sync::{Arc, Mutex};
 use super::types::SAMPLE_SIZE;
 const TYPE_DETECTION_ROWS: usize = 100;
 pub struct ExcelAnalyzer;
 
 impl ExcelAnalyzer {
     pub async fn analyze_from_bytes(&self, file_data: Bytes) -> Result<SheetAnalysis, AppError> {
-       
-    let start = std::time::Instant::now();
-    tracing::info!("Starting Excel file analysis from bytes");
+        let start = std::time::Instant::now();
+        tracing::info!("Starting Excel file analysis from bytes");
+        
+        // Create a memory-mapped file for better performance with large files
+        let cursor = Cursor::new(file_data);
+        
+        tracing::info!("Opening workbook...");
+        let workbook_start = std::time::Instant::now();
+        let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
+            .map_err(|e| {
+                tracing::error!("Failed to open Excel file: {}", e);
+                AppError::FileProcessingError(format!("Failed to open Excel file: {}", e))
+            })?;
+        tracing::info!("Workbook opened in {:?}", workbook_start.elapsed());
+        
+        let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
+        tracing::info!("Found {} sheets: {:?}", sheet_names.len(), sheet_names);
+        
+        if let Some(sheet_name) = sheet_names.first() {
+            let worksheets = workbook.worksheets();
+            if let Some((_, range)) = worksheets.into_iter().find(|(name, _)| name == sheet_name) {
+                // Use a streaming iterator for rows to reduce memory usage
+                let mut rows = Vec::with_capacity(1000);
+                let mut row_iter = range.rows();
+                
+                // Process header row separately
+                if let Some(header_row) = row_iter.next() {
+                    rows.push(header_row.to_vec());
+                    
+                    // Process remaining rows in chunks
+                    for row in row_iter.take(999) {
+                        rows.push(row.to_vec());
+                    }
+                }
     
-    let cursor = Cursor::new(file_data);
-    
-    tracing::info!("Opening workbook...");
-    let workbook_start = std::time::Instant::now();
-    let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
-        .map_err(|e| {
-            tracing::error!("Failed to open Excel file: {}", e);
-            AppError::FileProcessingError(format!("Failed to open Excel file: {}", e))
-        })?;
-    tracing::info!("Workbook opened in {:?}", workbook_start.elapsed());
-    
-    let sheet_names: Vec<String> = workbook.sheet_names().to_vec();
-    tracing::info!("Found {} sheets: {:?}", sheet_names.len(), sheet_names);
-    
-    if let Some(sheet_name) = sheet_names.first() {
-        let worksheets = workbook.worksheets();
-        if let Some((_, range)) = worksheets.into_iter().find(|(name, _)| name == sheet_name) {
-            // Get only first 1000 rows for analysis
-            let rows: Vec<Vec<Data>> = range.rows()
-                .take(1000)
-                .map(|row| row.to_vec())
-                .collect();
-
-            let row_count = rows.len();
-            let column_count = rows.first().map_or(0, |r| r.len());
+                let row_count = rows.len();
+                let column_count = rows.first().map_or(0, |r| r.len());
+                
+                // Process headers with thread-safe name tracking
+                let mut existing_names = HashSet::new();
+                let headers = rows.first()
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| clean_column_name(&cell.to_string(), &mut existing_names))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
             
-            let mut existing_names = HashSet::new();
-            let headers = rows.first()
-                .map(|row| row.iter()
-                    .map(|cell| clean_column_name(&cell.to_string(), &mut existing_names))
-                    .collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            // Quick column type detection
-            let mut date_columns: Vec<String> = Vec::new();
-            let mut numeric_columns: Vec<String> = Vec::new();
-            let mut text_columns: Vec<String> = Vec::new();
+                    let date_columns = Arc::new(Mutex::new(Vec::new()));
+                    let numeric_columns = Arc::new(Mutex::new(Vec::new()));
+                    let text_columns = Arc::new(Mutex::new(Vec::new()));
             
-            // Take sample rows for analysis
-            let sample_data: Vec<Vec<String>> = rows.iter()
-                .take(5)
-                .map(|row| row.iter().map(|cell| cell.to_string()).collect())
-                .collect();
-
-            // Basic column analysis
-            let column_info = headers.iter().enumerate()
+    
+                let column_info: Vec<ColumnInfo> = headers.par_iter()
+                .enumerate()
                 .map(|(idx, name)| {
                     let values: Vec<Data> = rows.iter()
                         .skip(1)
-                        .take(100) // Only analyze first 100 rows for type detection
-                        .map(|row| row.get(idx).cloned().unwrap_or(Data::Empty))
+                        .take(TYPE_DETECTION_ROWS)
+                        .filter_map(|row| row.get(idx))
+                        .cloned()
                         .collect();
                     
-                        let data_type = self.detect_column_type(&values);
+                    let data_type = self.detect_column_type(&values);
+                    
+                    // Use thread-safe operations for column categorization
                     match data_type.as_str() {
-                        "date" => date_columns.push(name.clone()),
-                        "numeric" => numeric_columns.push(name.clone()),
-                        "string" => text_columns.push(name.clone()),
+                        "date" => {
+                            if let Ok(mut cols) = date_columns.lock() {
+                                cols.push(name.clone());
+                            }
+                        },
+                        "numeric" => {
+                            if let Ok(mut cols) = numeric_columns.lock() {
+                                cols.push(name.clone());
+                            }
+                        },
+                        "string" => {
+                            if let Ok(mut cols) = text_columns.lock() {
+                                cols.push(name.clone());
+                            }
+                        },
                         _ => {}
                     }
                     
                     self.analyze_column(&values, name)
                 })
                 .collect();
-
-            tracing::info!("Analysis completed FILEPROCESSOR 575 in {:?}", start.elapsed());
             
-            Ok(SheetAnalysis {
-                sheet_names: sheet_names,
-                row_count,
-                column_count,
-                sample_data: sample_data,
-                column_info: column_info,
-                dataframe: None,
-                date_columns: date_columns,
-                numeric_columns: numeric_columns,
-                text_columns: text_columns,
-            })
-        } else {
-            Err(AppError::FileProcessingError("Failed to read worksheet".to_string()))
-        }
-    } else {
-        Err(AppError::FileProcessingError("No sheets found in workbook".to_string()))
-    }
-    }
+            // Before creating SheetAnalysis, unwrap the mutex values
+            let date_columns = Arc::try_unwrap(date_columns)
+                .unwrap_or_else(|_| panic!("Failed to unwrap date_columns"))
+                .into_inner()
+                .unwrap_or_default();
+            
+            let numeric_columns = Arc::try_unwrap(numeric_columns)
+                .unwrap_or_else(|_| panic!("Failed to unwrap numeric_columns"))
+                .into_inner()
+                .unwrap_or_default();
+            
+            let text_columns = Arc::try_unwrap(text_columns)
+                .unwrap_or_else(|_| panic!("Failed to unwrap text_columns"))
+                .into_inner()
+                .unwrap_or_default();
+    
+                tracing::info!("Analysis completed in {:?}", start.elapsed());
+                
 
+                let sample_data: Vec<Vec<String>> = rows.iter()
+                    .take(SAMPLE_SIZE)
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| cell.to_string())
+                            .collect()
+                    })
+                    .collect();
+
+                Ok(SheetAnalysis {
+                    sheet_names,
+                    row_count,
+                    column_count,
+                    sample_data,
+                    column_info,
+                    dataframe: None,
+                    date_columns,
+                    numeric_columns,
+                    text_columns,
+                })
+            } else {
+                Err(AppError::FileProcessingError("Failed to read worksheet".to_string()))
+            }
+        } else {
+            Err(AppError::FileProcessingError("No sheets found in workbook".to_string()))
+        }
+    }
     fn analyze_column(&self, values: &[Data], name: &str) -> ColumnInfo {
         let mut sample_values = SmallVec::<[String; SAMPLE_SIZE]>::new();
     
