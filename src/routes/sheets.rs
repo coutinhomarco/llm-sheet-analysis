@@ -103,19 +103,16 @@ async fn analyze_sheet(
         return Err(AppError::InvalidInput("Only XLSX files are supported".to_string()));
     }
 
-    // 2. Download file from URL (only once)
-    tracing::info!("Downloading file from URL...");
-    let download_start = std::time::Instant::now();
-    let file_data = file_processor::load_file_from_url(&file_info.signed_url).await?;
-    tracing::info!("File downloaded, size: {}KB, took: {:?}", file_data.len() / 1024, download_start.elapsed());
+    // 2. Download file and create DB loader concurrently
+    let (file_data, db_loader) = tokio::join!(
+        file_processor::load_file_from_url(&file_info.signed_url),
+        DbLoader::new()
+    );
     
-    // 3. Create DbLoader
-    tracing::info!("Initializing database loader...");
-    let db_start = std::time::Instant::now();
-    let db_loader = DbLoader::new().await?;
-    tracing::info!("Database loader initialized in {:?}", db_start.elapsed());
+    let file_data = file_data?;
+    let db_loader = db_loader?;
     
-    // 4. Analyze Excel file structure using the downloaded data
+    // 3. Analyze Excel file structure using the downloaded data
     tracing::info!("Starting Excel file analysis...");
     let analysis_start = std::time::Instant::now();
     let analysis = file_processor::analyze_excel_file_from_bytes(file_data.clone()).await?;
@@ -127,13 +124,13 @@ async fn analyze_sheet(
         analysis.column_count
     );
     
-    // 5. Process Excel file and load into database
+    // 4. Process Excel file and load into database
     tracing::info!("Loading data into database...");
     let db_load_start = std::time::Instant::now();
     let tables_created = file_processor::process_excel_file(file_data, &db_loader).await?;
     tracing::info!("Created {} tables in database in {:?}", tables_created, db_load_start.elapsed());
     
-    // 6. Generate LLM analysis
+    // 5. Generate LLM analysis
     tracing::info!("Starting LLM analysis...");
     let llm_start = std::time::Instant::now();
     let llm_agent = LlmAgent::new_with_loader(&state.config.openai_key, db_loader)?;

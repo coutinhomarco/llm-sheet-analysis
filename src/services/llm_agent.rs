@@ -61,7 +61,7 @@ impl LlmAgent {
         
         Ok(Self {
             client: Client::with_config(config),
-            model: "gpt-4-turbo-preview".to_string(),
+            model: "gpt-4o-mini".to_string(),
             db_loader,
         })
     }
@@ -69,18 +69,22 @@ impl LlmAgent {
     pub async fn generate_analysis(
         &self,
         messages: &[String],
-    ) -> Result<AgentResponse, AppError> {
-        // First, get Dolores to process the request
-        let dolores_response = self.call_dolores(messages).await?;
+    ) -> Result<AgentResponse, AppError> {        
+        // Run Dolores and schema fetch truly in parallel
+        let (dolores_response, schema) = tokio::join!(
+            self.call_dolores(messages),
+            self.db_loader.get_schema_with_samples()
+        );
         
-        // Then, let Teddy generate the SQL queries
-        let schema = self.db_loader.get_schema_with_samples().await?;
+        // Handle errors separately to avoid blocking
+        let (dolores_response, schema) = match (dolores_response, schema) {
+            (Ok(d), Ok(s)) => (d, s),
+            (Err(e), _) => return Err(e),
+            (_, Err(e)) => return Err(e),
+        };
+        
         let teddy_response = self.call_teddy(&dolores_response.request_for_teddy, &schema).await?;
-        
-        // Sanitize Teddy's response
-        let sanitized_response = self.sanitize_values(teddy_response);
-        
-        Ok(sanitized_response)
+        Ok(self.sanitize_values(teddy_response))
     }
 
     async fn call_dolores(&self, messages: &[String]) -> Result<DoloresResponse, AppError> {

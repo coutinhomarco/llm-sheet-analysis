@@ -5,12 +5,11 @@ use polars::prelude::*;
 use crate::error::AppError;
 use tracing::{info, debug, warn};
 use std::time::Duration;
-use rusqlite::types::ValueRef;
 use std::sync::Arc;
 
-const BATCH_SIZE: usize = 300;
+const BATCH_SIZE: usize = 1000;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
-const CACHE_CAPACITY: u64 = 100;
+const CACHE_CAPACITY: u64 = 300;
 
 #[derive(Clone)]
 pub struct DbLoader {
@@ -42,20 +41,22 @@ impl DbLoader {
     }
 
     pub async fn load_dataframe(&self, df: DataFrame, table_name: &str) -> Result<(), AppError> {
-        info!("Loading DataFrame into table: {}", table_name);
-        debug!("DataFrame shape: {} rows x {} columns", df.height(), df.width());
-
-        // Update current_table and column_names BEFORE database operations
-        {
+        // Update metadata concurrently
+        let metadata_update = async {
             *self.current_table.lock().await = Some(table_name.to_string());
             *self.column_names.lock().await = df.get_column_names()
                 .iter()
                 .map(|&s| s.to_string())
                 .collect();
-        }
-
-        // Cache the DataFrame
-        self.cache.insert(table_name.to_string(), df.clone());
+        };
+        
+        // Cache update
+        let cache_update = async {
+            self.cache.insert(table_name.to_string(), df.clone());
+        };
+        
+        // Run updates concurrently
+        tokio::join!(metadata_update, cache_update);
         
         let conn = self.conn.lock().await;
         let df = df.clone();
@@ -140,80 +141,41 @@ impl DbLoader {
 
     pub async fn get_schema_with_samples(&self) -> Result<String, AppError> {
         if !self.has_data().await {
-            warn!("Attempted to get schema before loading any data");
             return Ok("No data has been loaded into the database yet".to_string());
         }
         
         let conn = self.conn.lock().await;
         
         conn.call(|conn: &mut rusqlite::Connection| -> rusqlite::Result<String> {
-            // Get all tables
-            debug!("Querying for all tables");
-            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-            let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            let mut schema = String::with_capacity(4096);
+            let mut table_stmt = conn.prepare_cached("SELECT name FROM sqlite_master WHERE type='table'")?;
+            
+            let table_names: Vec<String> = table_stmt
+                .query_map([], |row| row.get::<_, String>(0))?
                 .filter_map(Result::ok)
                 .collect();
 
-            debug!("Found tables: {:?}", tables);
-            
-            if tables.is_empty() {
-                warn!("No tables found in database");
-                return Ok("No tables found in database".to_string());
-            }
-
-            let mut schema = String::new();
-            for table in tables {
-                info!("Processing table: {}", table);
-                schema.push_str(&format!("\nTable: {}\n", table));
+            for table_name in table_names {
+                schema.push_str(&format!("Table: {}\n", table_name));
                 
                 // Get column info
-                let pragma_sql = format!("PRAGMA table_info('{}')", table);
-                debug!("Getting column info with: {}", pragma_sql);
+                let cols_stmt = conn.prepare_cached(&format!(
+                    "SELECT * FROM {} LIMIT 1", table_name
+                ))?;
                 
-                let mut stmt = conn.prepare(&pragma_sql)?;
-                let cols: Vec<(String, String)> = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(1)?, // column name
-                        row.get::<_, String>(2)?, // data type
-                    ))
-                })?
-                .filter_map(Result::ok)
-                .collect();
+                let column_names: Vec<String> = cols_stmt
+                    .column_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
 
-                debug!("Found columns: {:?}", cols);
-                
                 schema.push_str("Columns:\n");
-                for col in cols {
-                    schema.push_str(&format!("  {} {}\n", col.0, col.1));
-                }
-
-                // Get sample data
-                let sample_sql = format!("SELECT * FROM '{}' LIMIT 3", table);
-                let mut stmt = conn.prepare(&sample_sql)?;
-                let mut rows = stmt.query([])?;
-                
-                schema.push_str("\nSample Data:\n");
-                while let Some(row) = rows.next()? {
-                    let mut row_data = Vec::new();
-                    let column_count = row.as_ref().column_count();
-                    
-                    for i in 0..column_count {
-                        let value = match row.get_ref(i)? {
-                            ValueRef::Null => "NULL".to_string(),
-                            ValueRef::Integer(i) => i.to_string(),
-                            ValueRef::Real(f) => f.to_string(),
-                            ValueRef::Text(t) => format!("'{}'", String::from_utf8_lossy(t)),
-                            ValueRef::Blob(_) => "BLOB".to_string(),
-                        };
-                        row_data.push(value);
-                    }
-                    schema.push_str(&format!("  {}\n", row_data.join(", ")));
+                for col in column_names {
+                    schema.push_str(&format!("  - {}\n", col));
                 }
                 schema.push_str("\n");
             }
 
-            info!("Successfully generated schema");
-            debug!("Final schema: {}", schema);
             Ok(schema)
         })
         .await
