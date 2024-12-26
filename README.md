@@ -1,4 +1,4 @@
-# Adapta One Sheet Services
+# Sheet Services
 
 A robust Rust-based microservice for analyzing and processing Excel sheets with advanced data manipulation capabilities and AI-powered insights.
 
