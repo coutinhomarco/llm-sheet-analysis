@@ -17,10 +17,6 @@ A robust Rust-based microservice for analyzing and processing Excel sheets with 
 Ensure you have Rust installed (version 1.78.0 or later). If not, install it from https://rustup.rs/.
 
 1. Clone the repository:
-```bash
-git clone https://github.com/your-username/adapta_one_sheet_services.git
-cd adapta_one_sheet_services
-```
 
 2. Create a `.env` file in the project root and add your OpenAI API key:
 ```bash
